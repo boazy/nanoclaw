@@ -75,6 +75,23 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
     const cached = userToThreadCache.get(userHandle);
     if (cached) return cached;
 
+    // Check the adapter's persisted DM room mapping before calling openDM
+    // (openDM hangs on Continuwuity)
+    const stateAdapter = (adapter as any).stateAdapter;
+    if (stateAdapter) {
+      const dmKey = (adapter as any).getDMStorageKey?.(userHandle);
+      if (dmKey) {
+        const roomId = await stateAdapter.get(dmKey);
+        if (roomId) {
+          const resolved = adapter.encodeThreadId({ roomID: roomId });
+          roomToUserCache.set(roomId, userHandle);
+          userToThreadCache.set(userHandle, resolved);
+          log.info('Matrix: resolved DM room from persisted state', { userHandle });
+          return resolved;
+        }
+      }
+    }
+
     log.info('Matrix: resolving DM room for user handle via openDM', { userHandle });
     const resolved = await adapter.openDM(userHandle);
 
