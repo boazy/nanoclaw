@@ -13,6 +13,7 @@
  *   MATRIX_RECOVERY_KEY         — enable E2EE cross-signing
  *   MATRIX_DEVICE_ID            — stable device ID across restarts
  */
+import 'fake-indexeddb/auto';
 import { createMatrixAdapter } from '@beeper/chat-adapter-matrix';
 
 import { log } from '../log.js';
@@ -169,8 +170,13 @@ registerChannelAdapter('matrix', {
     }
 
     const baseAdapter = createMatrixAdapter();
-    // Patch e2ee config to disable indexedDB (Node.js has no indexedDB)
-    (baseAdapter as any).e2eeConfig = { ...(baseAdapter as any).e2eeConfig, useIndexedDB: false };
+
+    log.info('Matrix adapter created', {
+      e2eeEnabled: (baseAdapter as any).e2eeEnabled,
+      hasRecoveryKey: Boolean((baseAdapter as any).recoveryKey),
+      hasDeviceId: Boolean((baseAdapter as any).deviceID),
+    });
+
     const matrixAdapter = wrapWithDmResolution(baseAdapter);
     const bridge = createChatSdkBridge({ adapter: matrixAdapter, concurrency: 'concurrent', supportsThreads: false });
 
