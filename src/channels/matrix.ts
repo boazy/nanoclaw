@@ -20,7 +20,6 @@ import { readEnvFile } from '../env.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
-
 const ENV_KEYS = [
   'MATRIX_BASE_URL',
   'MATRIX_ACCESS_TOKEN',
@@ -55,8 +54,8 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
   const origStartTyping = adapter.startTyping.bind(adapter);
   const origChannelIdFromThreadId = adapter.channelIdFromThreadId.bind(adapter);
 
-  // roomId → user handle, used to rewrite inbound channel IDs.
   const roomToUserCache = new Map<string, string>();
+  const userToThreadCache = new Map<string, string>();
 
   function isUserHandle(threadId: string): boolean {
     try {
@@ -71,14 +70,19 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
     if (!isUserHandle(threadId)) return threadId;
 
     const userHandle = threadId.startsWith('matrix:') ? threadId.slice('matrix:'.length) : threadId;
-    log.info('Matrix: resolving DM room for user handle', { userHandle });
+
+    const cached = userToThreadCache.get(userHandle);
+    if (cached) return cached;
+
+    log.info('Matrix: resolving DM room for user handle via openDM', { userHandle });
     const resolved = await adapter.openDM(userHandle);
 
     try {
       const { roomID } = adapter.decodeThreadId(resolved);
       roomToUserCache.set(roomID, userHandle);
+      userToThreadCache.set(userHandle, resolved);
     } catch {
-      // decode failure is non-fatal — outbound still works
+      // decode failure is non-fatal
     }
 
     return resolved;
@@ -92,7 +96,10 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
       if (!roomID.startsWith('!')) return origChannelIdFromThreadId(threadId);
 
       const cached = roomToUserCache.get(roomID);
-      if (cached) return `matrix:${cached}`;
+      if (cached) {
+        userToThreadCache.set(cached, threadId);
+        return `matrix:${cached}`;
+      }
 
       // Not cached — check if this is a DM by membership count
       const client = (adapter as any).client;
@@ -105,6 +112,7 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
       if (!otherMember) return origChannelIdFromThreadId(threadId);
 
       roomToUserCache.set(roomID, otherMember.userId);
+      userToThreadCache.set(otherMember.userId, threadId);
       return `matrix:${otherMember.userId}`;
     } catch {
       return origChannelIdFromThreadId(threadId);
