@@ -20,46 +20,6 @@ import { readEnvFile } from '../env.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
-// base58 alphabet used by matrix-js-sdk's recovery key encoding
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-const OLM_RECOVERY_KEY_PREFIX = [0x8b, 0x01];
-
-function decodeBase58(s: string): Uint8Array {
-  const bytes: number[] = [];
-  for (const c of s) {
-    const idx = BASE58_ALPHABET.indexOf(c);
-    if (idx < 0) throw new Error(`Invalid base58 character: ${c}`);
-    let carry = idx;
-    for (let j = 0; j < bytes.length; j++) {
-      carry += bytes[j] * 58;
-      bytes[j] = carry & 0xff;
-      carry >>= 8;
-    }
-    while (carry > 0) {
-      bytes.push(carry & 0xff);
-      carry >>= 8;
-    }
-  }
-  for (const c of s) {
-    if (c !== '1') break;
-    bytes.push(0);
-  }
-  return new Uint8Array(bytes.reverse());
-}
-
-function decodeRecoveryKey(encodedKey: string): Uint8Array {
-  const stripped = encodedKey.replace(/\s+/g, '');
-  const decoded = decodeBase58(stripped);
-  let parity = 0;
-  for (const b of decoded) parity ^= b;
-  if (parity !== 0) throw new Error('Incorrect parity');
-  for (let i = 0; i < OLM_RECOVERY_KEY_PREFIX.length; i++) {
-    if (decoded[i] !== OLM_RECOVERY_KEY_PREFIX[i]) throw new Error('Incorrect prefix');
-  }
-  // prefix (2 bytes) + key (32 bytes) + parity (1 byte) = 35 bytes
-  if (decoded.length !== 35) throw new Error(`Incorrect length: expected 35, got ${decoded.length}`);
-  return decoded.slice(OLM_RECOVERY_KEY_PREFIX.length, OLM_RECOVERY_KEY_PREFIX.length + 32);
-}
 
 const ENV_KEYS = [
   'MATRIX_BASE_URL',
@@ -197,23 +157,6 @@ registerChannelAdapter('matrix', {
 
     if (!process.env.MATRIX_INVITE_AUTOJOIN) {
       process.env.MATRIX_INVITE_AUTOJOIN = 'true';
-    }
-
-    // The adapter's getSecretStorageKey callback passes the recovery key
-    // through matrix-js-sdk's decodeRecoveryKey internally. However,
-    // matrix-sdk-crypto-wasm's verifyBackup receives the key via a separate
-    // path that expects raw base64-encoded bytes. Pre-decode here so both
-    // paths get the right format. The adapter reads from process.env, so
-    // we must set it before createMatrixAdapter().
-    const recoveryKey = env.MATRIX_RECOVERY_KEY;
-    if (recoveryKey) {
-      try {
-        const rawKey = decodeRecoveryKey(recoveryKey);
-        process.env.MATRIX_RECOVERY_KEY = Buffer.from(rawKey).toString('base64');
-        log.info('Matrix: recovery key decoded from base58 to raw key');
-      } catch (err) {
-        log.warn('Matrix: recovery key decode failed, passing as-is', { err });
-      }
     }
 
     const baseAdapter = createMatrixAdapter();
