@@ -195,34 +195,33 @@ registerChannelAdapter('matrix', {
       if (env[key]) process.env[key] = env[key];
     }
 
-    // Default: auto-join room invites so DMs work without manual acceptance
     if (!process.env.MATRIX_INVITE_AUTOJOIN) {
       process.env.MATRIX_INVITE_AUTOJOIN = 'true';
+    }
+
+    // The adapter's getSecretStorageKey callback passes the recovery key
+    // through matrix-js-sdk's decodeRecoveryKey internally. However,
+    // matrix-sdk-crypto-wasm's verifyBackup receives the key via a separate
+    // path that expects raw base64-encoded bytes. Pre-decode here so both
+    // paths get the right format. The adapter reads from process.env, so
+    // we must set it before createMatrixAdapter().
+    const recoveryKey = env.MATRIX_RECOVERY_KEY;
+    if (recoveryKey) {
+      try {
+        const rawKey = decodeRecoveryKey(recoveryKey);
+        process.env.MATRIX_RECOVERY_KEY = Buffer.from(rawKey).toString('base64');
+        log.info('Matrix: recovery key decoded from base58 to raw key');
+      } catch (err) {
+        log.warn('Matrix: recovery key decode failed, passing as-is', { err });
+      }
     }
 
     const baseAdapter = createMatrixAdapter();
 
     // Node.js has no indexedDB — disable it for the crypto store.
-    // Pre-decode the recovery key from space-separated base58 into raw
-    // 32-byte Curve25519 key material, then base64-encode for storagePassword.
-    // matrix-sdk-crypto-wasm expects raw key bytes, not the encoded string.
-    const recoveryKey = env.MATRIX_RECOVERY_KEY;
-    let decodedStoragePassword: string | undefined;
-    if (recoveryKey) {
-      try {
-        const rawKey = decodeRecoveryKey(recoveryKey);
-        decodedStoragePassword = Buffer.from(rawKey).toString('base64');
-        log.info('Matrix: recovery key decoded successfully');
-      } catch (err) {
-        log.warn('Matrix: failed to decode recovery key, using raw value', { err });
-        decodedStoragePassword = recoveryKey;
-      }
-    }
-
     (baseAdapter as any).e2eeConfig = {
       ...(baseAdapter as any).e2eeConfig,
       useIndexedDB: false,
-      ...(decodedStoragePassword ? { storagePassword: decodedStoragePassword } : {}),
     };
 
     const matrixAdapter = wrapWithDmResolution(baseAdapter);
