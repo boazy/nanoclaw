@@ -20,6 +20,47 @@ import { readEnvFile } from '../env.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
+// base58 alphabet used by matrix-js-sdk's recovery key encoding
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const OLM_RECOVERY_KEY_PREFIX = [0x8b, 0x01];
+
+function decodeBase58(s: string): Uint8Array {
+  const bytes: number[] = [];
+  for (const c of s) {
+    const idx = BASE58_ALPHABET.indexOf(c);
+    if (idx < 0) throw new Error(`Invalid base58 character: ${c}`);
+    let carry = idx;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (const c of s) {
+    if (c !== '1') break;
+    bytes.push(0);
+  }
+  return new Uint8Array(bytes.reverse());
+}
+
+function decodeRecoveryKey(encodedKey: string): Uint8Array {
+  const stripped = encodedKey.replace(/\s+/g, '');
+  const decoded = decodeBase58(stripped);
+  let parity = 0;
+  for (const b of decoded) parity ^= b;
+  if (parity !== 0) throw new Error('Incorrect parity');
+  for (let i = 0; i < OLM_RECOVERY_KEY_PREFIX.length; i++) {
+    if (decoded[i] !== OLM_RECOVERY_KEY_PREFIX[i]) throw new Error('Incorrect prefix');
+  }
+  // prefix (2 bytes) + key (32 bytes) + parity (1 byte) = 35 bytes
+  if (decoded.length !== 35) throw new Error(`Incorrect length: expected 35, got ${decoded.length}`);
+  return decoded.slice(OLM_RECOVERY_KEY_PREFIX.length, OLM_RECOVERY_KEY_PREFIX.length + 32);
+}
+
 const ENV_KEYS = [
   'MATRIX_BASE_URL',
   'MATRIX_ACCESS_TOKEN',
@@ -160,8 +201,30 @@ registerChannelAdapter('matrix', {
     }
 
     const baseAdapter = createMatrixAdapter();
-    // Patch e2ee config to disable indexedDB (Node.js has no indexedDB)
-    (baseAdapter as any).e2eeConfig = { ...(baseAdapter as any).e2eeConfig, useIndexedDB: false };
+
+    // Node.js has no indexedDB — disable it for the crypto store.
+    // Pre-decode the recovery key from space-separated base58 into raw
+    // 32-byte Curve25519 key material, then base64-encode for storagePassword.
+    // matrix-sdk-crypto-wasm expects raw key bytes, not the encoded string.
+    const recoveryKey = env.MATRIX_RECOVERY_KEY;
+    let decodedStoragePassword: string | undefined;
+    if (recoveryKey) {
+      try {
+        const rawKey = decodeRecoveryKey(recoveryKey);
+        decodedStoragePassword = Buffer.from(rawKey).toString('base64');
+        log.info('Matrix: recovery key decoded successfully');
+      } catch (err) {
+        log.warn('Matrix: failed to decode recovery key, using raw value', { err });
+        decodedStoragePassword = recoveryKey;
+      }
+    }
+
+    (baseAdapter as any).e2eeConfig = {
+      ...(baseAdapter as any).e2eeConfig,
+      useIndexedDB: false,
+      ...(decodedStoragePassword ? { storagePassword: decodedStoragePassword } : {}),
+    };
+
     const matrixAdapter = wrapWithDmResolution(baseAdapter);
     const bridge = createChatSdkBridge({ adapter: matrixAdapter, concurrency: 'concurrent', supportsThreads: false });
 
