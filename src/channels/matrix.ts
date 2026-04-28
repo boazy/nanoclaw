@@ -34,6 +34,159 @@ const ENV_KEYS = [
   'MATRIX_INVITE_AUTOJOIN_ALLOWLIST',
 ] as const;
 
+type AccountDataContent = Record<string, unknown>;
+
+interface MatrixClientForWarmup {
+  getCrypto?: () => {
+    bootstrapCrossSigning?: (opts: Record<string, unknown>) => Promise<void>;
+    crossSignDevice?: (deviceId: string) => Promise<void>;
+  } | null;
+  getAccountData?: (eventType: string) => unknown;
+  getAccountDataFromServer?: (eventType: string) => Promise<AccountDataContent | null>;
+  getEventMapper?: () => (raw: { type: string; content: AccountDataContent }) => unknown;
+  isInitialSyncComplete?: () => boolean;
+  store?: {
+    storeAccountDataEvents?: (events: unknown[]) => void;
+  };
+}
+
+/**
+ * Force-fetch one global `account_data` type from the homeserver even when
+ * `isInitialSyncComplete()` is true. matrix-js-sdk's
+ * `getAccountDataFromServer` normally short-circuits to the local store
+ * after initial sync; we temporarily override that flag so the network
+ * branch runs and we can pick up account_data missing from the saved-sync
+ * snapshot.
+ */
+async function forceFetchAccountData(client: MatrixClientForWarmup, type: string): Promise<AccountDataContent | null> {
+  if (!client.getAccountDataFromServer || !client.isInitialSyncComplete) return null;
+  const orig = client.isInitialSyncComplete.bind(client);
+  client.isInitialSyncComplete = () => false;
+  try {
+    return (await client.getAccountDataFromServer(type)) ?? null;
+  } finally {
+    client.isInitialSyncComplete = orig;
+  }
+}
+
+/**
+ * Hydrate the matrix-js-sdk store with the secret-storage and cross-signing
+ * `account_data` events that the bot's saved-sync snapshot did not include.
+ *
+ * After restart, the SDK boots from saved /sync data which may not contain
+ * `m.secret_storage.default_key`, `m.secret_storage.key.<id>`, or the three
+ * `m.cross_signing.*` encrypted secrets. Without them in the store,
+ * `secretStorage.get(...)` returns `undefined` (because
+ * `getAccountDataFromServer` short-circuits), and
+ * `crypto.bootstrapCrossSigning({})` falls into the upload-new-keys path
+ * which needs UIA we don't have.
+ *
+ * We force-fetch each event from the homeserver, build a `MatrixEvent`
+ * via `client.getEventMapper()`, and inject the events into the local
+ * store using the same path the sync handler uses
+ * (`store.storeAccountDataEvents`). After this, `secretStorage.get` finds
+ * the encrypted secrets, decrypts them via the recovery-key-backed
+ * `getSecretStorageKey` callback the adapter wires up, and bootstrap
+ * imports the cross-signing keys instead of trying to upload new ones.
+ */
+async function warmupSecretStorageAccountData(client: MatrixClientForWarmup): Promise<void> {
+  if (!client.getEventMapper || !client.store?.storeAccountDataEvents) return;
+
+  const mapper = client.getEventMapper();
+  const toStore: unknown[] = [];
+
+  async function ensure(type: string): Promise<AccountDataContent | null> {
+    if (client.getAccountData?.(type)) return null;
+    const content = await forceFetchAccountData(client, type);
+    if (!content) return null;
+    toStore.push(mapper({ type, content }));
+    return content;
+  }
+
+  const defaultKey = await ensure('m.secret_storage.default_key');
+  const defaultKeyId = typeof defaultKey?.key === 'string' ? defaultKey.key : null;
+  if (defaultKeyId) {
+    await ensure(`m.secret_storage.key.${defaultKeyId}`);
+  }
+
+  const master = await ensure('m.cross_signing.master');
+  const selfSigning = await ensure('m.cross_signing.self_signing');
+  const userSigning = await ensure('m.cross_signing.user_signing');
+
+  const keyIds = new Set<string>();
+  for (const secret of [master, selfSigning, userSigning]) {
+    const encrypted = secret?.encrypted;
+    if (encrypted && typeof encrypted === 'object') {
+      for (const keyId of Object.keys(encrypted)) keyIds.add(keyId);
+    }
+  }
+  for (const keyId of keyIds) {
+    await ensure(`m.secret_storage.key.${keyId}`);
+  }
+
+  if (toStore.length > 0) {
+    client.store!.storeAccountDataEvents!(toStore);
+    log.info('Matrix: warmed up account_data store', { injectedCount: toStore.length });
+  }
+}
+
+/**
+ * Load the bot's existing cross-signing private keys from secret storage
+ * and sign the bot's own device with the user-signing key, so recipients
+ * see encrypted messages as "verified" rather than "encrypted by a device
+ * not verified by its owner".
+ *
+ * The @beeper/chat-adapter-matrix adapter loads the megolm backup key from
+ * secret storage but never invokes any cross-signing API. We do it after
+ * `liveSyncReady`. To work around saved-sync booting the SDK with
+ * `isInitialSyncComplete()` already true (which prevents
+ * `secretStorage.get` from network-fetching missing account_data), we
+ * pre-warm the local store with the relevant events via
+ * `warmupSecretStorageAccountData` before calling `bootstrapCrossSigning`.
+ *
+ * Best-effort: failure logs a warning but does not block startup.
+ */
+async function selfSignBotDevice(adapter: ReturnType<typeof createMatrixAdapter>): Promise<void> {
+  const a = adapter as unknown as Record<string, unknown>;
+  const client = a.client as MatrixClientForWarmup | undefined;
+  const deviceID = typeof a.deviceID === 'string' ? a.deviceID : null;
+  if (!client || !deviceID) return;
+
+  const crypto = client.getCrypto?.();
+  if (!crypto) return;
+
+  try {
+    await warmupSecretStorageAccountData(client);
+  } catch (err) {
+    log.warn('Matrix: account_data warmup failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
+    if (crypto.bootstrapCrossSigning) {
+      await crypto.bootstrapCrossSigning({});
+      log.info('Matrix: bootstrapCrossSigning succeeded');
+    }
+  } catch (err) {
+    log.warn('Matrix: bootstrapCrossSigning failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  try {
+    if (crypto.crossSignDevice) {
+      await crypto.crossSignDevice(deviceID);
+      log.info('Matrix: cross-signed own device', { deviceID });
+    }
+  } catch (err) {
+    log.warn('Matrix: crossSignDevice failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 /**
  * Wrap the Matrix adapter so DM conversations are identified by user handle
  * across the whole system, not by ephemeral room IDs.
@@ -362,6 +515,8 @@ registerChannelAdapter('matrix', {
           resolve();
         }, 30_000);
       });
+
+      await selfSignBotDevice(matrixAdapter);
     };
 
     return bridge;
