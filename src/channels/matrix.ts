@@ -57,6 +57,103 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
 
   const roomToUserCache = new Map<string, string>();
   const userToThreadCache = new Map<string, string>();
+  const primedRooms = new Set<string>();
+
+  /**
+   * Seed matrix-js-sdk's Room state and rust-crypto's RoomEncryptor with the
+   * `m.room.encryption` (and self `m.room.member`) state events for `roomID`.
+   *
+   * After restart, the SDK boots from saved /sync data which is incremental and
+   * may not include unchanged state events; combined with `lazyLoadMembers`
+   * this leaves DM rooms with `room.hasEncryptionStateEvent() === false` and
+   * `room.getMyMembership() === "leave"`. matrix-js-sdk then silently sends
+   * outbound messages as plaintext m.room.message instead of m.room.encrypted.
+   *
+   * Fix: fetch full room state via GET /rooms/{id}/state, run the encryption
+   * event through `crypto.onCryptoEvent` (which seeds rust-crypto's
+   * RoomEncryptor), and inject both events into the Room's currentState.
+   *
+   * Cached per-room — at most one HTTP call per room per process lifetime.
+   */
+  async function primeRoomEncryptionIfNeeded(roomID: string): Promise<void> {
+    if (primedRooms.has(roomID)) return;
+
+    const a = adapter as unknown as Record<string, unknown>;
+    const client = a.client as
+      | {
+          getRoom?: (id: string) => unknown;
+          roomState?: (id: string) => Promise<Array<Record<string, unknown>>>;
+          getEventMapper?: () => (raw: Record<string, unknown>) => unknown;
+          getCrypto?: () => { onCryptoEvent?: (room: unknown, event: unknown) => Promise<void> } | null;
+          getUserId?: () => string | null;
+        }
+      | undefined;
+    if (!client) return;
+
+    const room = client.getRoom?.(roomID) as
+      | {
+          hasEncryptionStateEvent?: () => boolean;
+          currentState?: { setStateEvents?: (events: unknown[]) => void };
+        }
+      | undefined;
+    if (!room) return;
+
+    if (room.hasEncryptionStateEvent?.()) {
+      primedRooms.add(roomID);
+      return;
+    }
+
+    let stateEvents: Array<Record<string, unknown>>;
+    try {
+      stateEvents = (await client.roomState?.(roomID)) ?? [];
+    } catch (err) {
+      log.warn('Matrix: roomState fetch failed, leaving room un-primed', {
+        roomID,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    const encRaw = stateEvents.find((e) => e?.type === 'm.room.encryption' && (e?.state_key ?? '') === '');
+    if (!encRaw) {
+      primedRooms.add(roomID);
+      log.info('Matrix: room is unencrypted on server, no priming needed', { roomID });
+      return;
+    }
+
+    const mapper = client.getEventMapper?.();
+    const encEvent = mapper ? mapper(encRaw) : encRaw;
+
+    const crypto = client.getCrypto?.();
+    if (crypto?.onCryptoEvent) {
+      try {
+        await crypto.onCryptoEvent(room, encEvent);
+      } catch (err) {
+        log.warn('Matrix: crypto.onCryptoEvent failed', {
+          roomID,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    room.currentState?.setStateEvents?.([encEvent]);
+
+    const myUserId = client.getUserId?.();
+    const myMemberRaw = myUserId
+      ? stateEvents.find((e) => e?.type === 'm.room.member' && e?.state_key === myUserId)
+      : null;
+    if (myMemberRaw) {
+      const myMemberEvent = mapper ? mapper(myMemberRaw) : myMemberRaw;
+      room.currentState?.setStateEvents?.([myMemberEvent]);
+    }
+
+    log.info('Matrix: primed room encryption + membership state', {
+      roomID,
+      encryptionPrimed: Boolean(room.hasEncryptionStateEvent?.()),
+      memberPrimed: Boolean(myMemberRaw),
+    });
+    primedRooms.add(roomID);
+  }
 
   function isUserHandle(threadId: string): boolean {
     try {
@@ -160,6 +257,38 @@ function wrapWithDmResolution(adapter: ReturnType<typeof createMatrixAdapter>): 
     ...args: Parameters<typeof origPostMessage> extends [string, ...infer R] ? R : never
   ) => {
     const resolvedTid = await resolveThreadId(threadId);
+
+    let roomID: string | null = null;
+    try {
+      ({ roomID } = adapter.decodeThreadId(resolvedTid));
+    } catch {
+      roomID = null;
+    }
+    if (roomID) {
+      await primeRoomEncryptionIfNeeded(roomID);
+    }
+
+    const a = adapter as unknown as Record<string, unknown>;
+    const e2eeEnabled = Boolean(a.e2eeEnabled);
+    if (e2eeEnabled && roomID) {
+      const client = a.client as { getRoom?: (id: string) => unknown } | undefined;
+      const room = client?.getRoom?.(roomID) as
+        | {
+            getJoinedMemberCount?: () => number;
+            hasEncryptionStateEvent?: () => boolean;
+          }
+        | undefined;
+      const memberCount = room?.getJoinedMemberCount?.() ?? 0;
+      const hasEncState = Boolean(room?.hasEncryptionStateEvent?.());
+      // DMs (<=2 members) on an E2EE adapter must always be encrypted.
+      // Refuse to leak plaintext if priming couldn't establish encryption.
+      if (memberCount > 0 && memberCount <= 2 && !hasEncState) {
+        throw new Error(
+          `Matrix: refusing to send plaintext to DM ${roomID} — encryption state could not be established`,
+        );
+      }
+    }
+
     return origPostMessage(resolvedTid, ...args);
   };
 
