@@ -217,11 +217,22 @@ function enforceRunningContainerSla(
   session: Session,
   agentGroupId: string,
 ): void {
+  // Skip orphan claims: processing_ack rows whose matching messages_in row
+  // is no longer 'pending' (already failed, completed, or deleted). Those
+  // are remnants of a previous container that died without updating
+  // processing_ack, and the next container's startup will clear them via
+  // clearStaleProcessingAcks(). Killing the live container based on an
+  // orphan claim is wrong and produces a deadlock: each new container is
+  // killed before it can run startup cleanup.
+  const claims = getProcessingClaims(outDb).filter(
+    (claim) => getMessageForRetry(inDb, claim.message_id, 'pending') != null,
+  );
+
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
-    claims: getProcessingClaims(outDb),
+    claims,
   });
 
   if (decision.action === 'ok') return;
