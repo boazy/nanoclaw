@@ -151,18 +151,13 @@ async function pollSweep(): Promise<void> {
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) {
-    log.info('[debug-slack-drop] deliverSessionMessages SKIP locked', { sessionId: session.id });
-    return;
-  }
-  log.info('[debug-slack-drop] deliverSessionMessages ENTRY', { sessionId: session.id });
+  if (inflightDeliveries.has(session.id)) return;
   inflightDeliveries.add(session.id);
 
   try {
     await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
-    log.info('[debug-slack-drop] deliverSessionMessages EXIT', { sessionId: session.id });
   }
 }
 
@@ -187,16 +182,6 @@ async function drainSession(session: Session): Promise<void> {
     // Filter out already-delivered messages using inbound.db's delivered table
     const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    const dvAtQueue = (inDb.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
-    log.info('[debug-slack-drop] drainSession queue', {
-      sessionId: session.id,
-      allDueCount: allDue.length,
-      deliveredCount: delivered.size,
-      undeliveredCount: undelivered.length,
-      undeliveredIds: undelivered.map((m) => m.id),
-      allDueIds: allDue.map((m) => m.id),
-      dataVersion: dvAtQueue,
-    });
     if (undelivered.length === 0) return;
 
     // Ensure platform_message_id column exists (migration for existing sessions)
@@ -204,26 +189,14 @@ async function drainSession(session: Session): Promise<void> {
 
     for (const msg of undelivered) {
       try {
-        log.info('[debug-slack-drop] deliverMessage call', {
-          msgId: msg.id,
-          channelType: msg.channel_type,
-          platformId: msg.platform_id,
-          threadId: msg.thread_id,
-          kind: msg.kind,
-          contentLen: msg.content.length,
-        });
         const platformMsgId = await deliverMessage(msg, session, inDb);
-        log.info('[debug-slack-drop] deliverMessage returned', {
-          msgId: msg.id,
-          platformMsgId,
-          platformMsgIdType: typeof platformMsgId,
-        });
-        // [Phase C — host-side defensive] Refuse to mark a real channel
-        // message delivered when the adapter returned no platform id. The
-        // pre-fix behavior was a silent drop into the `delivered` table with
-        // NULL `platform_message_id` and `status='delivered'`, after which
-        // the message would never be retried. Throwing here lets the
-        // existing retry/MAX_DELIVERY_ATTEMPTS path fire instead.
+        // [silent-drop-guard] Refuse to mark a real channel message delivered
+        // when the adapter returned no platform id. The pre-guard behavior was
+        // a silent drop into the `delivered` table with NULL
+        // `platform_message_id` and `status='delivered'`, after which the
+        // message would never be retried. Throwing here lets the existing
+        // retry/MAX_DELIVERY_ATTEMPTS path fire instead. Drop this when
+        // upstream nanocoai/nanoclaw#2226 lands.
         if (
           platformMsgId == null &&
           msg.kind !== 'system' &&
