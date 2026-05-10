@@ -151,13 +151,18 @@ async function pollSweep(): Promise<void> {
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) return;
+  if (inflightDeliveries.has(session.id)) {
+    log.info('[debug-slack-drop] deliverSessionMessages SKIP locked', { sessionId: session.id });
+    return;
+  }
+  log.info('[debug-slack-drop] deliverSessionMessages ENTRY', { sessionId: session.id });
   inflightDeliveries.add(session.id);
 
   try {
     await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
+    log.info('[debug-slack-drop] deliverSessionMessages EXIT', { sessionId: session.id });
   }
 }
 
@@ -182,6 +187,14 @@ async function drainSession(session: Session): Promise<void> {
     // Filter out already-delivered messages using inbound.db's delivered table
     const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
+    log.info('[debug-slack-drop] drainSession queue', {
+      sessionId: session.id,
+      allDueCount: allDue.length,
+      deliveredCount: delivered.size,
+      undeliveredCount: undelivered.length,
+      undeliveredIds: undelivered.map((m) => m.id),
+      allDueIds: allDue.map((m) => m.id),
+    });
     if (undelivered.length === 0) return;
 
     // Ensure platform_message_id column exists (migration for existing sessions)
@@ -203,6 +216,23 @@ async function drainSession(session: Session): Promise<void> {
           platformMsgId,
           platformMsgIdType: typeof platformMsgId,
         });
+        // [Phase C — host-side defensive] Refuse to mark a real channel
+        // message delivered when the adapter returned no platform id. The
+        // pre-fix behavior was a silent drop into the `delivered` table with
+        // NULL `platform_message_id` and `status='delivered'`, after which
+        // the message would never be retried. Throwing here lets the
+        // existing retry/MAX_DELIVERY_ATTEMPTS path fire instead.
+        if (
+          platformMsgId == null &&
+          msg.kind !== 'system' &&
+          msg.channel_type !== 'agent' &&
+          msg.channel_type != null &&
+          msg.platform_id != null
+        ) {
+          throw new Error(
+            `[silent-drop-guard] deliverMessage returned empty platformMsgId for ${msg.id} (channel=${msg.channel_type}, platform=${msg.platform_id}, kind=${msg.kind})`,
+          );
+        }
         markDelivered(inDb, msg.id, platformMsgId ?? null);
         deliveryAttempts.delete(msg.id);
 
