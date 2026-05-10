@@ -338,17 +338,6 @@ export function markDeliveryFailed(db: Database.Database, messageOutId: string):
   });
 }
 
-export function markDeliveryFailed(db: Database.Database, messageOutId: string): void {
-  const callerStack = new Error('stack-trace').stack?.split('\n').slice(2, 7).join(' | ');
-  log.info('[debug-slack-drop] markDeliveryFailed called', {
-    messageOutId,
-    callerStack,
-  });
-  db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'failed', datetime('now'))",
-  ).run(messageOutId);
-}
-
 /** Ensure the delivered table has columns added after initial schema. */
 export function migrateDeliveredTable(db: Database.Database): void {
   const cols = new Set(
