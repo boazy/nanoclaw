@@ -7,6 +7,7 @@
  */
 import Database from 'better-sqlite3';
 
+import { log } from '../log.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -243,12 +244,38 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
 }
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
-  db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', datetime('now'))",
-  ).run(messageOutId, platformMessageId ?? null);
+  const callerStack = new Error('stack-trace').stack?.split('\n').slice(2, 7).join(' | ');
+  log.info('[debug-slack-drop] markDelivered called', {
+    messageOutId,
+    platformMessageId,
+    platformMessageIdType: typeof platformMessageId,
+    callerStack,
+  });
+  const result = db
+    .prepare(
+      "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', datetime('now'))",
+    )
+    .run(messageOutId, platformMessageId ?? null);
+  const row = db
+    .prepare('SELECT platform_message_id, status, delivered_at FROM delivered WHERE message_out_id = ?')
+    .get(messageOutId) as { platform_message_id: string | null; status: string; delivered_at: string } | undefined;
+  log.info('[debug-slack-drop] markDelivered after-insert', {
+    messageOutId,
+    insertChanges: result.changes,
+    requestedPlatformMessageId: platformMessageId,
+    actualPlatformMessageId: row?.platform_message_id,
+    actualStatus: row?.status,
+    actualDeliveredAt: row?.delivered_at,
+    mismatch: platformMessageId != null && row?.platform_message_id !== platformMessageId,
+  });
 }
 
 export function markDeliveryFailed(db: Database.Database, messageOutId: string): void {
+  const callerStack = new Error('stack-trace').stack?.split('\n').slice(2, 7).join(' | ');
+  log.info('[debug-slack-drop] markDeliveryFailed called', {
+    messageOutId,
+    callerStack,
+  });
   db.prepare(
     "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'failed', datetime('now'))",
   ).run(messageOutId);
