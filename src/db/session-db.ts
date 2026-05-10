@@ -245,17 +245,27 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
   const callerStack = new Error('stack-trace').stack?.split('\n').slice(2, 7).join(' | ');
+  const dvBefore = (db.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
+  const beforeRow = db
+    .prepare('SELECT platform_message_id, status, delivered_at FROM delivered WHERE message_out_id = ?')
+    .get(messageOutId) as { platform_message_id: string | null; status: string; delivered_at: string } | undefined;
   log.info('[debug-slack-drop] markDelivered called', {
     messageOutId,
     platformMessageId,
     platformMessageIdType: typeof platformMessageId,
     callerStack,
+    dataVersionBefore: dvBefore,
+    rowExistedBefore: !!beforeRow,
+    beforePlatformMessageId: beforeRow?.platform_message_id ?? null,
+    beforeStatus: beforeRow?.status ?? null,
+    beforeDeliveredAt: beforeRow?.delivered_at ?? null,
   });
   const result = db
     .prepare(
       "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', datetime('now'))",
     )
     .run(messageOutId, platformMessageId ?? null);
+  const dvAfter = (db.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
   const row = db
     .prepare('SELECT platform_message_id, status, delivered_at FROM delivered WHERE message_out_id = ?')
     .get(messageOutId) as { platform_message_id: string | null; status: string; delivered_at: string } | undefined;
@@ -267,6 +277,29 @@ export function markDelivered(db: Database.Database, messageOutId: string, platf
     actualStatus: row?.status,
     actualDeliveredAt: row?.delivered_at,
     mismatch: platformMessageId != null && row?.platform_message_id !== platformMessageId,
+    dataVersionBefore: dvBefore,
+    dataVersionAfter: dvAfter,
+    dataVersionDelta: dvAfter - dvBefore,
+  });
+}
+
+export function markDeliveryFailed(db: Database.Database, messageOutId: string): void {
+  const callerStack = new Error('stack-trace').stack?.split('\n').slice(2, 7).join(' | ');
+  const dvBefore = (db.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
+  log.info('[debug-slack-drop] markDeliveryFailed called', {
+    messageOutId,
+    callerStack,
+    dataVersionBefore: dvBefore,
+  });
+  db.prepare(
+    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'failed', datetime('now'))",
+  ).run(messageOutId);
+  const dvAfter = (db.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
+  log.info('[debug-slack-drop] markDeliveryFailed after-insert', {
+    messageOutId,
+    dataVersionBefore: dvBefore,
+    dataVersionAfter: dvAfter,
+    dataVersionDelta: dvAfter - dvBefore,
   });
 }
 

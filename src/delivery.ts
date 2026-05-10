@@ -187,6 +187,7 @@ async function drainSession(session: Session): Promise<void> {
     // Filter out already-delivered messages using inbound.db's delivered table
     const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
+    const dvAtQueue = (inDb.prepare('PRAGMA data_version').get() as { data_version: number }).data_version;
     log.info('[debug-slack-drop] drainSession queue', {
       sessionId: session.id,
       allDueCount: allDue.length,
@@ -194,6 +195,7 @@ async function drainSession(session: Session): Promise<void> {
       undeliveredCount: undelivered.length,
       undeliveredIds: undelivered.map((m) => m.id),
       allDueIds: allDue.map((m) => m.id),
+      dataVersion: dvAtQueue,
     });
     if (undelivered.length === 0) return;
 
