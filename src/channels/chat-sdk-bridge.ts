@@ -492,6 +492,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             tid,
             attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
           );
+          if (!result?.id) {
+            throw new Error(
+              `[silent-drop-guard] adapter.postMessage returned no id (adapter=${adapter.name}, tid=${tid}, chunkIdx=${i}/${chunks.length}, rawOk=${String((result?.raw as { ok?: unknown } | undefined)?.ok)})`,
+            );
+          }
           if (i === 0) firstId = result?.id;
         }
         return firstId;

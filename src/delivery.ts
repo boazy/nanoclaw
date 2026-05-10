@@ -190,6 +190,24 @@ async function drainSession(session: Session): Promise<void> {
     for (const msg of undelivered) {
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
+        // [silent-drop-guard] Refuse to mark a real channel message delivered
+        // when the adapter returned no platform id. The pre-guard behavior was
+        // a silent drop into the `delivered` table with NULL
+        // `platform_message_id` and `status='delivered'`, after which the
+        // message would never be retried. Throwing here lets the existing
+        // retry/MAX_DELIVERY_ATTEMPTS path fire instead. Drop this when
+        // upstream nanocoai/nanoclaw#2226 lands.
+        if (
+          platformMsgId == null &&
+          msg.kind !== 'system' &&
+          msg.channel_type !== 'agent' &&
+          msg.channel_type != null &&
+          msg.platform_id != null
+        ) {
+          throw new Error(
+            `[silent-drop-guard] deliverMessage returned empty platformMsgId for ${msg.id} (channel=${msg.channel_type}, platform=${msg.platform_id}, kind=${msg.kind})`,
+          );
+        }
         markDelivered(inDb, msg.id, platformMsgId ?? null);
         deliveryAttempts.delete(msg.id);
 
