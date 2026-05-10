@@ -354,6 +354,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const tid = threadId ?? platformId;
       const content = message.content as Record<string, unknown>;
 
+      // [TEMPORARY] Slack silent-drop investigation. See FORK.md patch #8 and
+      // openclaw/HANDOFF.slack-delivery.md. Remove with the rest of this patch
+      // once the empty-platform_message_id bug is diagnosed and fixed.
+      log.info('[debug-slack-drop] deliver entry', {
+        adapter: adapter.name,
+        platformId,
+        threadId,
+        kind: message.kind,
+        operation: typeof content.operation === 'string' ? content.operation : undefined,
+        contentType: typeof content.type === 'string' ? content.type : undefined,
+        hasMarkdown: typeof content.markdown === 'string' && (content.markdown as string).length > 0,
+        hasText: typeof content.text === 'string' && (content.text as string).length > 0,
+        hasFiles: !!message.files && message.files.length > 0,
+      });
+
       if (content.operation === 'edit' && content.messageId) {
         await adapter.editMessage(tid, content.messageId as string, {
           markdown: transformText((content.text as string) || (content.markdown as string) || ''),
@@ -418,10 +433,30 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+          log.info('[debug-slack-drop] postMessage attempt', {
+            adapter: adapter.name,
+            tid,
+            chunkIdx: i,
+            chunkLen: chunk.length,
+            chunksTotal: chunks.length,
+            attachFiles: !!attachFiles,
+          });
           const result = await adapter.postMessage(
             tid,
             attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
           );
+          log.info('[debug-slack-drop] postMessage result', {
+            adapter: adapter.name,
+            tid,
+            chunkIdx: i,
+            hasResult: !!result,
+            resultId: result?.id,
+            resultIdType: typeof result?.id,
+            rawOk: (result?.raw as { ok?: unknown } | undefined)?.ok,
+            rawTs: (result?.raw as { ts?: unknown } | undefined)?.ts,
+            rawError: (result?.raw as { error?: unknown } | undefined)?.error,
+            rawWarning: (result?.raw as { warning?: unknown } | undefined)?.warning,
+          });
           if (i === 0) firstId = result?.id;
         }
         return firstId;
@@ -432,8 +467,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           filename: f.filename,
         }));
         const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+        log.info('[debug-slack-drop] postMessage result (files-only)', {
+          adapter: adapter.name,
+          tid,
+          hasResult: !!result,
+          resultId: result?.id,
+          resultIdType: typeof result?.id,
+        });
         return result?.id;
       }
+      log.warn('[debug-slack-drop] deliver no-text-no-files implicit return undefined', {
+        adapter: adapter.name,
+        tid,
+        kind: message.kind,
+        contentKeys: Object.keys(content),
+      });
     },
 
     async setTyping(platformId: string, threadId: string | null) {

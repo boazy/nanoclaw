@@ -189,7 +189,20 @@ async function drainSession(session: Session): Promise<void> {
 
     for (const msg of undelivered) {
       try {
+        log.info('[debug-slack-drop] deliverMessage call', {
+          msgId: msg.id,
+          channelType: msg.channel_type,
+          platformId: msg.platform_id,
+          threadId: msg.thread_id,
+          kind: msg.kind,
+          contentLen: msg.content.length,
+        });
         const platformMsgId = await deliverMessage(msg, session, inDb);
+        log.info('[debug-slack-drop] deliverMessage returned', {
+          msgId: msg.id,
+          platformMsgId,
+          platformMsgIdType: typeof platformMsgId,
+        });
         markDelivered(inDb, msg.id, platformMsgId ?? null);
         deliveryAttempts.delete(msg.id);
 
